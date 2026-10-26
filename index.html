@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="robots" content="noindex">
+<title>Новый инцидент</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #fff);
+    --bg2: var(--tg-theme-secondary-bg-color, #f2f2f7);
+    --text: var(--tg-theme-text-color, #111);
+    --hint: var(--tg-theme-hint-color, #8e8e93);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #fff);
+    --danger: var(--tg-theme-destructive-text-color, #e53935);
+    --line: color-mix(in srgb, var(--hint) 35%, transparent);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg2); color: var(--text);
+         font: 15px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .card { background: var(--bg); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
+  label, .label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 6px; }
+  input, textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+         font: inherit; color: var(--text); background: var(--bg); }
+  textarea { min-height: 120px; resize: vertical; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .readonly { font-weight: 600; }
+  .note { font-size: 12px; color: var(--hint); margin-top: 6px; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .seg button { border: 1px solid var(--line); background: var(--bg); color: var(--text);
+         border-radius: 8px; padding: 10px 6px; font: inherit; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  #teamFilter { margin-bottom: 8px; }
+  .teams { max-height: 320px; overflow-y: auto; }
+  .team { display: flex; gap: 10px; align-items: flex-start; padding: 8px 2px; border-top: 1px solid var(--line); cursor: pointer; }
+  .team:first-child { border-top: 0; }
+  .team input { width: 18px; height: 18px; margin: 2px 0 0; flex: none; accent-color: var(--accent); }
+  .team .name { font-size: 14px; }
+  .team .who { font-size: 12px; color: var(--accent); word-break: break-all; }
+  .chosen { font-size: 13px; margin-top: 8px; }
+  .error { color: var(--danger); font-size: 14px; margin: 8px 0; min-height: 1em; }
+  .counter { text-align: right; }
+  #fallback { display: none; text-align: center; padding: 40px 10px; color: var(--hint); }
+</style>
+</head>
+<body>
+<div id="fallback">Эта форма открывается только кнопкой «🚨 Открыть инцидент» в боте.</div>
+<div id="form" hidden>
+  <h1>🚨 Новый инцидент</h1>
+
+  <div class="card">
+    <label for="summary">Тема</label>
+    <input id="summary" maxlength="255" placeholder="Например: Не проходят платежи через банк X">
+  </div>
+
+  <div class="card">
+    <span class="label">Время начала</span>
+    <div class="readonly" id="now">—</div>
+    <div class="note">Бот ставит время открытия, при необходимости поправь в Jira.</div>
+  </div>
+
+  <div class="card">
+    <label for="symptoms">Симптомы</label>
+    <textarea id="symptoms" maxlength="1500" placeholder="Что сломалось, у кого, ошибки, масштаб…"></textarea>
+    <div class="note counter" id="counter">0 / 1500</div>
+  </div>
+
+  <div class="card">
+    <span class="label">Статус инцидента</span>
+    <div class="seg" id="statuses"></div>
+  </div>
+
+  <div class="card" id="teamsCard">
+    <span class="label">Ответственные — дежурные команд <span id="dutyDate"></span></span>
+    <input id="teamFilter" placeholder="Поиск команды">
+    <div class="teams" id="teams"></div>
+    <div class="chosen" id="chosen"></div>
+    <div class="note">Бот ещё раз сверится с «Графиком» в момент создания.</div>
+  </div>
+
+  <div class="error" id="error"></div>
+</div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+const $ = (id) => document.getElementById(id);
+const MAX_BYTES = 4000; // лимит sendData — 4096 байт
+let status = null;
+const picked = new Set();
+
+function readPayload() {
+  try {
+    let b64 = location.hash.slice(1).replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (e) {
+    return null;
+  }
+}
+
+function setError(text) {
+  $("error").textContent = text || "";
+  if (text && tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+}
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function nowText() {
+  const d = new Date();
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function renderStatuses(list) {
+  const box = $("statuses");
+  list.forEach((s) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = s;
+    b.onclick = () => {
+      status = s;
+      [...box.children].forEach((c) => c.classList.toggle("on", c === b));
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+    };
+    box.appendChild(b);
+  });
+}
+
+function renderChosen() {
+  $("chosen").textContent = picked.size ? "Выбрано: " + [...picked].join(", ") : "";
+}
+
+function renderTeams(teams, date) {
+  if (!teams.length) {
+    $("teamsCard").hidden = true;
+    return;
+  }
+  $("dutyDate").textContent = date ? `на ${date}` : "";
+  const box = $("teams");
+  teams.forEach(([team, who]) => {
+    const row = document.createElement("label");
+    row.className = "team";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.onchange = () => { cb.checked ? picked.add(team) : picked.delete(team); renderChosen(); };
+    const text = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = team;
+    const w = document.createElement("div");
+    w.className = "who";
+    w.textContent = who;
+    text.append(name, w);
+    row.append(cb, text);
+    row.dataset.search = (team + " " + who).toLowerCase();
+    box.appendChild(row);
+  });
+  $("teamFilter").oninput = (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    [...box.children].forEach((r) => { r.hidden = q && !r.dataset.search.includes(q); });
+  };
+}
+
+function submit() {
+  setError("");
+  const summary = $("summary").value.trim();
+  const symptoms = $("symptoms").value.trim();
+  if (summary.length < 3) return setError("Заполни тему");
+  if (symptoms.length < 3) return setError("Опиши симптомы");
+  if (!status) return setError("Выбери статус");
+  const data = JSON.stringify({ summary, symptoms, status, teams: [...picked] });
+  if (new TextEncoder().encode(data).length > MAX_BYTES) return setError("Слишком длинный текст, сократи симптомы");
+  tg.sendData(data); // Telegram закроет форму и передаст данные боту
+}
+
+(function init() {
+  const p = readPayload();
+  if (!tg || !tg.initData && tg.platform === "unknown" || !p) {
+    $("fallback").style.display = "block";
+    return;
+  }
+  tg.ready();
+  tg.expand();
+  $("now").textContent = nowText();
+  renderStatuses(p.s || []);
+  renderTeams(p.t || [], p.d);
+  $("symptoms").oninput = (e) => { $("counter").textContent = `${e.target.value.length} / 1500`; };
+  $("form").hidden = false;
+  tg.MainButton.setText("Открыть инцидент");
+  tg.MainButton.onClick(submit);
+  tg.MainButton.show();
+})();
+</script>
+</body>
+</html>
